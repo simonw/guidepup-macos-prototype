@@ -4,7 +4,7 @@ import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { voiceOver } from "@guidepup/guidepup";
+import { macOSActivate, voiceOver } from "@guidepup/guidepup";
 import { macOSRecord } from "@guidepup/record";
 import { webkit } from "playwright";
 
@@ -31,6 +31,7 @@ const audioProbeDurationSeconds = Number.parseInt(
 );
 
 const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+const expectedPagePattern = /Guidepup media smoke|Start audio probe/i;
 
 async function fileSize(filePath) {
   try {
@@ -159,6 +160,19 @@ async function main() {
     }
   };
 
+  const activateWebContent = async (page) => {
+    await macOSActivate("Playwright");
+    await page.bringToFront();
+    await page.locator("body").waitFor();
+    await page.locator("body").focus();
+    await page.locator("#page-title").focus();
+    await sleep(500);
+    await voiceOver.interact();
+    await voiceOver.perform(voiceOver.keyboardCommands.jumpToLeftEdge);
+    await voiceOver.clearItemTextLog();
+    await voiceOver.clearSpokenPhraseLog();
+  };
+
   try {
     if (process.platform !== "darwin") {
       throw new Error("This smoke test must run on macOS.");
@@ -203,24 +217,33 @@ async function main() {
 
     const page = await context.newPage();
     await page.goto(pathToFileURL(pagePath).href);
+    await page.locator("#page-title").waitFor();
     await page.bringToFront();
-    await page.locator("body").click({ position: { x: 80, y: 80 } });
+    await page.locator("#page-title").focus();
+    await macOSActivate("Playwright");
 
     await voiceOver.start();
     voiceOverStarted = true;
     await sleep(1500);
-    await voiceOver.clearSpokenPhraseLog();
-    await voiceOver.clearItemTextLog();
-
-    await page.bringToFront();
-    await page.keyboard.press("Tab");
+    await activateWebContent(page);
     await sleep(1000);
-    await rememberPhrase("tab to first control");
+
+    await rememberPhrase("navigate to web content");
 
     for (let index = 0; index < 8; index += 1) {
-      await voiceOver.next();
+      const itemText = await voiceOver.itemText();
+      if (expectedPagePattern.test(itemText)) {
+        phraseEvents.push({
+          label: `observed expected page content ${index + 1}`,
+          offsetMs: Date.now() - startedAt,
+          text: itemText,
+        });
+        break;
+      }
+
+      await voiceOver.perform(voiceOver.keyboardCommands.findNextHeading);
       await sleep(650);
-      await rememberPhrase(`voiceover next ${index + 1}`);
+      await rememberPhrase(`find next heading ${index + 1}`);
     }
 
     await page.keyboard.press("Tab");
@@ -251,7 +274,7 @@ async function main() {
       ...spokenPhraseLog,
       ...itemTextLog,
       ...phraseEvents.map((event) => event.text),
-    ].some((text) => /Guidepup media smoke|Start audio probe/i.test(text));
+    ].some((text) => expectedPagePattern.test(text));
   } catch (error) {
     errors.push(String(error));
   } finally {
@@ -317,6 +340,10 @@ async function main() {
     errors.push("VoiceOver transcript is empty.");
   }
 
+  if (!summary.checks.expectedPageContentObserved) {
+    errors.push("VoiceOver did not observe the expected page content.");
+  }
+
   if (!summary.checks.sessionVideoNonEmpty) {
     errors.push("Guidepup desktop session video is missing or empty.");
   }
@@ -356,6 +383,7 @@ async function main() {
 
   await writeFile(summaryJsonPath, JSON.stringify(summary, null, 2));
   await writeFile(summaryMarkdownPath, markdown);
+  console.log(markdown);
 
   if (errors.length > 0) {
     throw new Error(

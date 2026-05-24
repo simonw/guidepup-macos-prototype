@@ -68,6 +68,11 @@ jobs:
       - name: Run VoiceOver media smoke
         run: npm run test:voiceover:media
 
+      - name: List generated artifacts
+        if: always()
+        run: |
+          find artifacts recordings test-results -maxdepth 3 -type f -print 2>/dev/null | sort || true
+
       - name: Publish smoke summary
         if: always()
         run: |

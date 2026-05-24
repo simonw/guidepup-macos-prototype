@@ -5,13 +5,12 @@
   "type": "module",
   "description": "Prototype for running Guidepup on macOS in GitHub Actions with audio and video artifacts.",
   "scripts": {
-    "build:audio-probe": "mkdir -p artifacts/module-cache && CLANG_MODULE_CACHE_PATH=artifacts/module-cache swiftc -parse-as-library scripts/SystemAudioProbe.swift -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia -framework CoreGraphics -o artifacts/system-audio-probe",
+    "build:audio-probe": "mkdir -p artifacts \"${TMPDIR:-/tmp}/guidepup-swift-module-cache\" && CLANG_MODULE_CACHE_PATH=\"${TMPDIR:-/tmp}/guidepup-swift-module-cache\" swiftc -parse-as-library scripts/SystemAudioProbe.swift -framework ScreenCaptureKit -framework AVFoundation -framework CoreMedia -framework CoreGraphics -o artifacts/system-audio-probe",
     "test:voiceover:media": "node scripts/run-voiceover-media-smoke.mjs"
   },
   "dependencies": {
     "@guidepup/guidepup": "^0.24.1",
     "@guidepup/record": "^0.1.0",
     "playwright": "^1.60.0"
-  },
-  "devDependencies": {}
+  }
 }
