@@ -227,6 +227,17 @@ SUMMARY
   fi
 fi
 
+if [[ -f "$VOICEOVER_ARTIFACTS_DIR/summary.json" ]]; then
+  if ! node -e 'const fs = require("node:fs"); const summary = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.exit(summary.finalized === true ? 0 : 1);' "$VOICEOVER_ARTIFACTS_DIR/summary.json"; then
+    {
+      echo
+      echo "## Errors"
+      echo "- VoiceOver media smoke summary was written before finalization completed."
+    } >> "$VOICEOVER_ARTIFACTS_DIR/summary.md"
+    core_status=1
+  fi
+fi
+
 echo
 echo "Generated files:"
 find "$VOICEOVER_ARTIFACTS_DIR" "$VOICEOVER_RECORDINGS_DIR" "$VOICEOVER_TEST_RESULTS_DIR" \

@@ -93,6 +93,22 @@ function waitForChild(child, timeoutMs) {
   });
 }
 
+async function withTimeout(label, operation, timeoutMs) {
+  let timeout;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => {
+          reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function startDesktopRecording(filepath) {
   await mkdir(dirname(filepath), { recursive: true });
   await unlink(filepath).catch(() => {});
@@ -180,6 +196,44 @@ function readVoiceOverRateAsPercent() {
   return Number.isFinite(rate) ? rate : null;
 }
 
+function buildSummaryMarkdown(summary, notes, errors) {
+  return [
+    "# VoiceOver Media Smoke",
+    "",
+    `- Finalized: ${Boolean(summary.finalized)}`,
+    `- VoiceOver started: ${Boolean(summary.checks.voiceOverStarted)}`,
+    `- VoiceOver stopped cleanly: ${summary.checks.voiceOverStoppedCleanly ?? "unknown"}`,
+    `- VoiceOver requested speech rate: ${summary.requestedVoiceOverRateAsPercent}%`,
+    `- VoiceOver observed speech rate: ${summary.checks.voiceOverRateAsPercent ?? "unknown"}%`,
+    `- Transcript entries: ${
+      (summary.checks.spokenPhraseCount ?? 0) +
+      (summary.checks.itemTextCount ?? 0) +
+      (summary.checks.phraseEventCount ?? 0)
+    }`,
+    `- Expected page content observed: ${Boolean(
+      summary.checks.expectedPageContentObserved,
+    )}`,
+    `- Session video bytes: ${summary.checks.sessionVideoBytes}`,
+    `- Audio bytes: ${summary.checks.audioBytes}`,
+    `- Audio peak amplitude: ${summary.checks.audioPeakAmplitude}`,
+    `- Require system audio: ${requireSystemAudio}`,
+    "",
+    "## Notes",
+    ...notes.map((note) => `- ${note}`),
+    "",
+    "## Errors",
+    ...(errors.length > 0 ? errors.map((error) => `- ${error}`) : ["- None"]),
+    "",
+  ].join("\n");
+}
+
+async function writeSummary(summary, notes, errors) {
+  const markdown = buildSummaryMarkdown(summary, notes, errors);
+  await writeFile(summaryJsonPath, JSON.stringify(summary, null, 2));
+  await writeFile(summaryMarkdownPath, markdown);
+  return markdown;
+}
+
 async function main() {
   await Promise.all([
     mkdir(artifactsDir, { recursive: true }),
@@ -201,6 +255,7 @@ async function main() {
 
   const summary = {
     startedAt: new Date(startedAt).toISOString(),
+    finalized: false,
     platform: process.platform,
     requireSystemAudio,
     guidepupDefaultRateAsPercent,
@@ -215,6 +270,7 @@ async function main() {
     },
     checks: {
       voiceOverStarted: false,
+      voiceOverStoppedCleanly: null,
       voiceOverRateAsPercent: null,
       spokenPhraseCount: 0,
       itemTextCount: 0,
@@ -383,31 +439,27 @@ async function main() {
   } catch (error) {
     errors.push(String(error));
   } finally {
-    if (voiceOverStarted) {
-      await voiceOver.stop().catch((error) => {
-        errors.push(`Could not stop VoiceOver cleanly: ${error}`);
-      });
-    }
+    await writeSummary(summary, notes, [
+      ...errors,
+      "Summary checkpoint written before cleanup completed.",
+    ]).catch((error) => {
+      console.error(`Could not write cleanup checkpoint summary: ${error}`);
+    });
 
     if (context) {
-      await context.close().catch((error) => {
-        errors.push(`Could not close Playwright context cleanly: ${error}`);
-      });
+      log("Closing Playwright context.");
+      await withTimeout("Closing Playwright context", () => context.close(), 10_000).catch(
+        (error) => {
+          errors.push(`Could not close Playwright context cleanly: ${error}`);
+        },
+      );
     }
 
     if (browser) {
-      await browser.close().catch((error) => {
+      log("Closing browser.");
+      await withTimeout("Closing browser", () => browser.close(), 10_000).catch((error) => {
         errors.push(`Could not close browser cleanly: ${error}`);
       });
-    }
-
-    if (screenRecordingStop) {
-      try {
-        await Promise.resolve(screenRecordingStop());
-        await sleep(1500);
-      } catch (error) {
-        errors.push(`Could not stop Guidepup desktop recording: ${error}`);
-      }
     }
 
     if (audioProbe) {
@@ -449,10 +501,6 @@ async function main() {
     errors.push("VoiceOver did not observe the expected page content.");
   }
 
-  if (!summary.checks.sessionVideoNonEmpty) {
-    errors.push("Guidepup desktop session video is missing or empty.");
-  }
-
   if (requireSystemAudio && !summary.checks.audioFileNonEmpty) {
     errors.push("System-audio probe file is missing or empty.");
   }
@@ -461,35 +509,44 @@ async function main() {
     errors.push("System-audio probe did not report non-silent audio.");
   }
 
-  const markdown = [
-    "# VoiceOver Media Smoke",
-    "",
-    `- VoiceOver started: ${Boolean(summary.checks.voiceOverStarted)}`,
-    `- VoiceOver requested speech rate: ${summary.requestedVoiceOverRateAsPercent}%`,
-    `- VoiceOver observed speech rate: ${summary.checks.voiceOverRateAsPercent ?? "unknown"}%`,
-    `- Transcript entries: ${
-      (summary.checks.spokenPhraseCount ?? 0) +
-      (summary.checks.itemTextCount ?? 0) +
-      (summary.checks.phraseEventCount ?? 0)
-    }`,
-    `- Expected page content observed: ${Boolean(
-      summary.checks.expectedPageContentObserved,
-    )}`,
-    `- Session video bytes: ${summary.checks.sessionVideoBytes}`,
-    `- Audio bytes: ${summary.checks.audioBytes}`,
-    `- Audio peak amplitude: ${summary.checks.audioPeakAmplitude}`,
-    `- Require system audio: ${requireSystemAudio}`,
-    "",
-    "## Notes",
-    ...notes.map((note) => `- ${note}`),
-    "",
-    "## Errors",
-    ...(errors.length > 0 ? errors.map((error) => `- ${error}`) : ["- None"]),
-    "",
-  ].join("\n");
+  summary.finalized = true;
+  let markdown = await writeSummary(summary, notes, errors);
 
-  await writeFile(summaryJsonPath, JSON.stringify(summary, null, 2));
-  await writeFile(summaryMarkdownPath, markdown);
+  if (screenRecordingStop) {
+    try {
+      log("Stopping desktop session recording.");
+      await Promise.resolve(screenRecordingStop());
+      await sleep(1500);
+      summary.checks.sessionVideoBytes = await fileSize(sessionVideoPath);
+      summary.checks.sessionVideoNonEmpty = summary.checks.sessionVideoBytes > 1024;
+      if (!summary.checks.sessionVideoNonEmpty) {
+        errors.push("Guidepup desktop session video is missing or empty.");
+      }
+      markdown = await writeSummary(summary, notes, errors);
+    } catch (error) {
+      errors.push(`Could not stop Guidepup desktop recording: ${error}`);
+      process.exitCode = 1;
+      markdown = await writeSummary(summary, notes, errors);
+    }
+  }
+
+  if (errors.length > 0) {
+    process.exitCode = 1;
+  }
+
+  if (voiceOverStarted) {
+    log("Stopping VoiceOver.");
+    try {
+      await withTimeout("Stopping VoiceOver", () => voiceOver.stop(), 15_000);
+      summary.checks.voiceOverStoppedCleanly = true;
+    } catch (error) {
+      summary.checks.voiceOverStoppedCleanly = false;
+      errors.push(`Could not stop VoiceOver cleanly: ${error}`);
+      process.exitCode = 1;
+    }
+    markdown = await writeSummary(summary, notes, errors);
+  }
+
   console.log(markdown);
 
   if (errors.length > 0) {
