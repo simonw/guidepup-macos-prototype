@@ -4,5 +4,7 @@ artifacts/
 recordings/
 test-results/
 playwright-report/
+local-runs/
+voice-over.jsonl
 
 .DS_Store

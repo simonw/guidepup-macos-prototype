@@ -1,18 +1,32 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { macOSActivate, voiceOver } from "@guidepup/guidepup";
-import { macOSRecord } from "@guidepup/record";
 import { webkit } from "playwright";
 
+const require = createRequire(import.meta.url);
+const { DEFAULT_GUIDEPUP_VOICEOVER_SETTINGS } = require(
+  "@guidepup/guidepup/lib/macOS/VoiceOver/configureSettings.js",
+);
+
 const rootDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const artifactsDir = join(rootDir, "artifacts");
-const recordingsDir = join(rootDir, "recordings");
+const resolveFromRoot = (value, fallback) =>
+  resolve(rootDir, value ?? fallback);
+
+const artifactsDir = resolveFromRoot(process.env.VOICEOVER_ARTIFACTS_DIR, "artifacts");
+const recordingsDir = resolveFromRoot(
+  process.env.VOICEOVER_RECORDINGS_DIR,
+  "recordings",
+);
 const playwrightVideoDir = join(recordingsDir, "playwright");
-const testResultsDir = join(rootDir, "test-results");
+const testResultsDir = resolveFromRoot(
+  process.env.VOICEOVER_TEST_RESULTS_DIR,
+  "test-results",
+);
 
 const sessionVideoPath = join(recordingsDir, "guidepup-session.mov");
 const audioProbePath = join(artifactsDir, "system-audio-probe");
@@ -29,9 +43,19 @@ const audioProbeDurationSeconds = Number.parseInt(
   process.env.AUDIO_PROBE_SECONDS ?? "45",
   10,
 );
+const guidepupDefaultRateAsPercent =
+  DEFAULT_GUIDEPUP_VOICEOVER_SETTINGS.rateAsPercent;
+const voiceOverRateAsPercent = Number.parseInt(
+  process.env.VOICEOVER_RATE_AS_PERCENT ??
+    String(guidepupDefaultRateAsPercent * 2),
+  10,
+);
+const voiceOverRateKey =
+  "SCRCategories_SCRCategorySystemWide_SCRSpeechLanguages_default_SCRSpeechComponentSettings_SCRRateAsPercent";
 
 const sleep = (ms) => new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 const expectedPagePattern = /Guidepup media smoke|Start audio probe/i;
+const log = (message) => console.log(`[voiceover-media-smoke] ${message}`);
 
 async function fileSize(filePath) {
   try {
@@ -47,6 +71,11 @@ function waitForChild(child, timeoutMs) {
     const timeout = setTimeout(() => {
       if (!settled) {
         child.kill("SIGTERM");
+        setTimeout(() => {
+          if (!settled) {
+            child.kill("SIGKILL");
+          }
+        }, 2000);
       }
     }, timeoutMs);
 
@@ -62,6 +91,35 @@ function waitForChild(child, timeoutMs) {
       resolveWait({ code: null, signal: null, error: String(error) });
     });
   });
+}
+
+async function startDesktopRecording(filepath) {
+  await mkdir(dirname(filepath), { recursive: true });
+  await unlink(filepath).catch(() => {});
+
+  const child = spawn("/usr/sbin/screencapture", [
+    "-v",
+    "-C",
+    "-k",
+    "-T0",
+    "-g",
+    filepath,
+  ]);
+
+  return async () => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return;
+    }
+
+    try {
+      child.stdin.write("q");
+      child.stdin.end();
+    } catch {
+      child.kill("SIGTERM");
+    }
+
+    await waitForChild(child, 5000);
+  };
 }
 
 function escapeSrt(text) {
@@ -107,6 +165,21 @@ async function readAudioReport() {
   }
 }
 
+function readVoiceOverRateAsPercent() {
+  const result = spawnSync(
+    "defaults",
+    ["read", "com.apple.VoiceOver4/default", voiceOverRateKey],
+    { encoding: "utf8" },
+  );
+
+  if (result.status !== 0) {
+    return null;
+  }
+
+  const rate = Number.parseInt(result.stdout.trim(), 10);
+  return Number.isFinite(rate) ? rate : null;
+}
+
 async function main() {
   await Promise.all([
     mkdir(artifactsDir, { recursive: true }),
@@ -130,7 +203,8 @@ async function main() {
     startedAt: new Date(startedAt).toISOString(),
     platform: process.platform,
     requireSystemAudio,
-    checks: {},
+    guidepupDefaultRateAsPercent,
+    requestedVoiceOverRateAsPercent: voiceOverRateAsPercent,
     artifacts: {
       sessionVideoPath,
       playwrightVideoDir,
@@ -138,6 +212,15 @@ async function main() {
       audioReportPath,
       transcriptPath,
       subtitlesPath,
+    },
+    checks: {
+      voiceOverStarted: false,
+      voiceOverRateAsPercent: null,
+      spokenPhraseCount: 0,
+      itemTextCount: 0,
+      phraseEventCount: 0,
+      transcriptNonEmpty: false,
+      expectedPageContentObserved: false,
     },
     notes,
     errors,
@@ -161,7 +244,7 @@ async function main() {
   };
 
   const activateWebContent = async (page) => {
-    await macOSActivate("Playwright");
+    await macOSActivate("Playwright", { timeout: 5, retries: 1 });
     await page.bringToFront();
     await page.locator("body").waitFor();
     await page.locator("body").focus();
@@ -178,14 +261,20 @@ async function main() {
       throw new Error("This smoke test must run on macOS.");
     }
 
+    if (!Number.isFinite(voiceOverRateAsPercent) || voiceOverRateAsPercent <= 0) {
+      throw new Error("VOICEOVER_RATE_AS_PERCENT must be a positive integer.");
+    }
+
     try {
-      screenRecordingStop = macOSRecord(sessionVideoPath);
+      log("Starting desktop session recording.");
+      screenRecordingStop = await startDesktopRecording(sessionVideoPath);
       notes.push("Started Guidepup desktop session recording.");
     } catch (error) {
       errors.push(`Could not start Guidepup desktop recording: ${error}`);
     }
 
     if (existsSync(audioProbePath)) {
+      log("Starting ScreenCaptureKit system-audio probe.");
       audioProbe = spawn(
         audioProbePath,
         [audioPath, audioReportPath, String(audioProbeDurationSeconds)],
@@ -206,6 +295,7 @@ async function main() {
       stdio: "ignore",
     });
 
+    log("Launching Playwright WebKit.");
     browser = await webkit.launch({ headless: false });
     context = await browser.newContext({
       viewport: { width: 1280, height: 720 },
@@ -220,11 +310,25 @@ async function main() {
     await page.locator("#page-title").waitFor();
     await page.bringToFront();
     await page.locator("#page-title").focus();
-    await macOSActivate("Playwright");
+    await macOSActivate("Playwright", { timeout: 5, retries: 1 });
 
+    log("Starting VoiceOver.");
+    DEFAULT_GUIDEPUP_VOICEOVER_SETTINGS.rateAsPercent = voiceOverRateAsPercent;
+    notes.push(
+      `Configured Guidepup to launch real VoiceOver at speech rate ${voiceOverRateAsPercent}% (default was ${guidepupDefaultRateAsPercent}%).`,
+    );
     await voiceOver.start();
     voiceOverStarted = true;
+    summary.checks.voiceOverRateAsPercent = readVoiceOverRateAsPercent();
+    if (summary.checks.voiceOverRateAsPercent === voiceOverRateAsPercent) {
+      notes.push(`Observed real VoiceOver speech rate ${voiceOverRateAsPercent}%.`);
+    } else {
+      errors.push(
+        `Expected VoiceOver speech rate ${voiceOverRateAsPercent}%, observed ${summary.checks.voiceOverRateAsPercent ?? "unknown"}%.`,
+      );
+    }
     await sleep(1500);
+    log("Activating web content for VoiceOver.");
     await activateWebContent(page);
     await sleep(1000);
 
@@ -250,6 +354,7 @@ async function main() {
     await sleep(1000);
     await rememberPhrase("tab to next control");
 
+    log("Collecting VoiceOver transcript.");
     const spokenPhraseLog = await voiceOver.spokenPhraseLog();
     const itemTextLog = await voiceOver.itemTextLog();
 
@@ -360,6 +465,8 @@ async function main() {
     "# VoiceOver Media Smoke",
     "",
     `- VoiceOver started: ${Boolean(summary.checks.voiceOverStarted)}`,
+    `- VoiceOver requested speech rate: ${summary.requestedVoiceOverRateAsPercent}%`,
+    `- VoiceOver observed speech rate: ${summary.checks.voiceOverRateAsPercent ?? "unknown"}%`,
     `- Transcript entries: ${
       (summary.checks.spokenPhraseCount ?? 0) +
       (summary.checks.itemTextCount ?? 0) +
