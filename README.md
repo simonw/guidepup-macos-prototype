@@ -1,6 +1,9 @@
 # guidepup-macos-prototype
 A prototype of running Guidepup on macOS in GitHub Actions
 
+> [!CAUTION]
+> Everything in this repo, both text and code, was built by Codex (with GPT-5.5 xhigh) and is unreviewed.
+
 ## VoiceOver media smoke experiment
 
 This repo contains a GitHub Actions experiment that tries to run
