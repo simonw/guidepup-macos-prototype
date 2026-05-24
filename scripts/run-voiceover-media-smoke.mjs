@@ -67,6 +67,11 @@ async function fileSize(filePath) {
 
 function waitForChild(child, timeoutMs) {
   return new Promise((resolveWait) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolveWait({ code: child.exitCode, signal: child.signalCode });
+      return;
+    }
+
     let settled = false;
     const timeout = setTimeout(() => {
       if (!settled) {
@@ -355,10 +360,6 @@ async function main() {
     browser = await webkit.launch({ headless: false });
     context = await browser.newContext({
       viewport: { width: 1280, height: 720 },
-      recordVideo: {
-        dir: playwrightVideoDir,
-        size: { width: 1280, height: 720 },
-      },
     });
 
     const page = await context.newPage();
@@ -447,19 +448,15 @@ async function main() {
     });
 
     if (context) {
-      log("Closing Playwright context.");
-      await withTimeout("Closing Playwright context", () => context.close(), 10_000).catch(
-        (error) => {
-          errors.push(`Could not close Playwright context cleanly: ${error}`);
-        },
+      notes.push(
+        "Skipped Playwright context.close because WebKit cleanup can hang on macOS runners; desktop recording is the session video artifact.",
       );
     }
 
     if (browser) {
-      log("Closing browser.");
-      await withTimeout("Closing browser", () => browser.close(), 10_000).catch((error) => {
-        errors.push(`Could not close browser cleanly: ${error}`);
-      });
+      notes.push(
+        "Skipped Playwright browser.close because WebKit cleanup can hang on macOS runners.",
+      );
     }
 
     if (audioProbe) {
@@ -556,7 +553,11 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+main()
+  .then(() => {
+    process.exit(process.exitCode ?? 0);
+  })
+  .catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
