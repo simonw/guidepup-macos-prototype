@@ -1,0 +1,88 @@
+name: voiceover-media-smoke
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Pinned macOS runner image"
+        required: true
+        default: macos-14
+        type: choice
+        options:
+          - macos-14
+          - macos-15
+      require_audio:
+        description: "Fail the job if the system-audio probe is empty or silent"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  voiceover-media-smoke:
+    name: VoiceOver media smoke (${{ github.event.inputs.runner || 'macos-14' }})
+    runs-on: ${{ github.event.inputs.runner || 'macos-14' }}
+    timeout-minutes: 30
+    env:
+      REQUIRE_SYSTEM_AUDIO: ${{ github.event.inputs.require_audio || 'true' }}
+      AUDIO_PROBE_SECONDS: "45"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright WebKit
+        run: npx playwright install webkit
+
+      - name: Setup VoiceOver automation
+        uses: guidepup/setup-action@0.19.0
+        with:
+          record: true
+          resolutionWidth: "1280"
+          resolutionHeight: "720"
+
+      - name: Build ScreenCaptureKit audio probe
+        run: npm run build:audio-probe
+
+      - name: Inspect media environment
+        if: always()
+        run: |
+          mkdir -p artifacts
+          sw_vers > artifacts/macos-version.txt
+          system_profiler SPAudioDataType > artifacts/audio-devices.txt || true
+          system_profiler SPDisplaysDataType > artifacts/displays.txt || true
+          xcrun simctl list > artifacts/simctl-list.txt || true
+
+      - name: Run VoiceOver media smoke
+        run: npm run test:voiceover:media
+
+      - name: Publish smoke summary
+        if: always()
+        run: |
+          if [ -f artifacts/summary.md ]; then
+            cat artifacts/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload VoiceOver media artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: voiceover-media-smoke-${{ github.event.inputs.runner || 'macos-14' }}-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            artifacts/**/*
+            recordings/**/*
+            test-results/**/*
